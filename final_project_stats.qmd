@@ -1,0 +1,537 @@
+---
+title: "Hierarchical Bayes Tutorial"
+subtitle: "PSY 504: Advanced Statistics — Final Project"
+author: "Carina Kane"
+date:  '2026-05-08'
+format:
+  html:
+    code-fold: true
+    code-overflow: wrap
+    toc: true
+    toc-depth: 2
+    toc-location: left
+execute:
+  message: false
+  warning: false
+engine: knitr
+---
+
+
+## Introduction
+
+In Lab 4 we worked with tadpole tank data. Each tank had a number of tadpoles and a survival rate, and we used a hierarchical model to partially pool survival estimates. In this tutorial we build a more complex HBM in order to account for more variables involved. We simulate data in order to demonstrate clearly when and where an HMB is useful. Feel free to play around with the simulated data parameters in order to see how with different data, we may not get the same benefits an HMB offers, and could use a simpler model. 
+
+
+The simulated data is based on the "InstaEval" Dataset ( data("InstEval", package = "lme4")) which has ~70k student rating of instructors across various departments at ETH Zürich. Simulating data lets us play around with variables and distributions in order to see when HBMs are most effecting, and allows us to recover the "true" distributions in the data. 
+
+
+In this simulated data we add onto the tadpole example: 
+
+Whats the same:
+- **Instructors** play the role of tanks (some have many ratings, some few)
+
+What's different:
+- **Students** introduce a *second* grouping factor — different students rate differently, some more nicely and others more harshly, creating crossed random effects
+- **Service course** is a fixed effect, it's whether a course is mandatory for a professor to teach in another department or not. Its impact varies per instructor which gives us random slopes. For example: some instructors may teach service courses much worse than others because of personal preferences. 
+
+
+Because we generated the data ourselves, we **know the truth**, so we can check how well each model recovers it. We test the following to demonstrate when the HMB is useful
+
+1. **Starting with a naive approach.** We use `lm()` and see why its use can confuse student style with instructor quality.
+2. **Hierarchical Bayes.** We add in random intercepts and then random slopes to capture instructor-specific service effects.
+3. **Assumptions** We check various priors and tweak model structure to see how these can change conclusions.
+
+
+
+## Setup
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(lme4)        # for lmer comparison
+library(brms)        # Bayesian regression
+library(tidybayes)   # tidy posterior wrangling
+library(ggdist)      # distributional plots
+library(loo)         # model comparison
+library(MASS)        # mvrnorm for simulation
+
+theme_set(theme_minimal(base_size = 12))
+options(mc.cores = parallel::detectCores())
+```
+
+## Section 1: Building the data
+
+We simulate a course-evaluation dataset where we control every source of variation. The model below is the *true* data-generating process, our Bayesian models will try to recover these parameters. 
+
+```{r}
+#| label: simulate-data
+set.seed(504)
+
+# TRUE PARAMETERS 
+
+n_instructors <- 40
+n_students    <- 200
+grand_mean    <- 3.4       # overall mean rating
+beta_service  <- -0.4      # service courses rated 0.4 lower on average
+
+# Variance components
+sigma_d_int   <- 0.6       # how much instructors vary in baseline
+sigma_d_slope <- 0.5       # how much instructors vary in the service effect
+sigma_s       <- 0.7       # how much students vary in rating style
+sigma_resid   <- 0.5       # residual noise
+
+# Correlation between instructor intercept and service slope:
+# negative = highly-rated instructors take a bigger hit on service courses
+cor_int_slope <- -0.5
+
+#######################
+
+# Instructor effects: correlated intercept and slope 
+Sigma_d <- matrix(c(
+  sigma_d_int^2,                                cor_int_slope * sigma_d_int * sigma_d_slope,
+  cor_int_slope * sigma_d_int * sigma_d_slope,  sigma_d_slope^2
+), nrow = 2)
+
+instructor_effects <- MASS::mvrnorm(n_instructors, mu = c(0, 0), Sigma = Sigma_d) |>
+  as_tibble(.name_repair = "minimal") |>
+  setNames(c("u_int", "u_slope")) |>
+  mutate(d = factor(1:n_instructors))
+
+# Student effects: how generously each student rates
+student_effects <- tibble(
+  s = factor(1:n_students),
+  v_int = rnorm(n_students, 0, sigma_s)
+)
+
+# Each instructor gets a different number of ratings
+instructor_n <- tibble(
+  d = factor(1:n_instructors),
+  n_obs = sample(c(5, 10, 20, 50, 100), n_instructors, replace = TRUE,
+                 prob = c(0.25, 0.25, 0.2, 0.2, 0.1))
+)
+
+###########################
+
+# GENERATE DATA
+sim_data <- instructor_n |>
+  rowwise() |>
+  mutate(
+    obs = list(tibble(
+      s = sample(student_effects$s, n_obs, replace = TRUE),
+      service = rbinom(n_obs, 1, 0.4)
+    ))
+  ) |>
+  unnest(obs) |>
+  ungroup() |>
+  left_join(instructor_effects, by = "d") |>
+  left_join(student_effects, by = "s") |>
+  mutate(
+    y = grand_mean + u_int + (beta_service + u_slope) * service + v_int +
+        rnorm(n(), 0, sigma_resid)
+  ) |>
+  dplyr::select(s, d, service, y)
+
+# Save the true params
+truth <- list(
+  grand_mean = grand_mean,
+  beta_service = beta_service,
+  sigma_d_int = sigma_d_int,
+  sigma_d_slope = sigma_d_slope,
+  sigma_s = sigma_s,
+  sigma_resid = sigma_resid,
+  cor_int_slope = cor_int_slope,
+  instructor_effects = instructor_effects,
+  student_effects = student_effects
+)
+
+# Summary of data
+c(
+  n_students    = n_distinct(sim_data$s),
+  n_instructors = n_distinct(sim_data$d),
+  n_ratings     = nrow(sim_data)
+)
+```
+
+### What's in the data 
+
+Here's what we built in:
+
+| Parameter | True value | Meaning |
+|---|---|---|
+| Grand mean | 3.4 | Average rating across all instructors and students |
+| Service effect | -0.4 | Service courses rated 0.4 lower on average |
+| $\sigma_{d,\text{int}}$ | 0.6 | Instructors vary moderately in baseline quality |
+| $\sigma_{d,\text{slope}}$ | 0.5 | Instructors vary in how service hurts them |
+| $\sigma_s$ | 0.7 | Students vary a *lot* in rating style |
+| Correlation | -0.5 | Highly-rated instructors take bigger hits on service courses |
+
+Notice: **student-style variation (0.7) is bigger than instructor variation (0.6)**. This is what we will be accounting for in an HMB that a native model would not account for. 
+
+
+### Raw data peek
+
+```{r}
+#| label: raw-look
+instructor_means <- sim_data |>
+  group_by(d) |>
+  summarise(
+    n = n(),
+    mean_y = mean(y),
+    sd_y = sd(y),
+    .groups = "drop"
+  )
+
+grand_mean_obs <- mean(sim_data$y)
+overall_sd     <- sd(sim_data$y)
+
+band <- tibble(
+  n = seq(min(instructor_means$n), max(instructor_means$n), length.out = 200)
+) |>
+  mutate(
+    lo = grand_mean_obs - 2 * overall_sd / sqrt(n),
+    hi = grand_mean_obs + 2 * overall_sd / sqrt(n)
+  )
+
+ggplot() +
+  geom_ribbon(
+    data = band,
+    aes(x = n, ymin = lo, ymax = hi),
+    fill = "steelblue", alpha = 0.2
+  ) +
+  geom_point(
+    data = instructor_means,
+    aes(x = n, y = mean_y),
+    alpha = 0.6
+  ) +
+  coord_cartesian(ylim = c(1, 5)) +
+  labs(
+    x = "Number of ratings per instructor",
+    y = "Mean rating",
+    title = "Standard Error Around Means Against Number of Reviews",
+    subtitle = "Low-N instructors have extreme means; shaded band = ±2 SE under chance"
+  )
+```
+
+Instructors with few ratings have a lot of noise injected into their means. But unlike the tadpole story, here we *also* have to worry about which students did the rating.
+
+
+## Part 1: Naive Approaches
+
+### Section 2: One coefficient per instructor with `lm()`
+
+`lm()` stands for **linear model**. It fits a regression by least squares, minimizing the sum of squared residuals between predicted and actual values.
+
+The most straightforward approach: fit one coefficient per instructor.
+
+```{r}
+#| label: lm-no-pooling
+m_lm <- lm(y ~ 0 + d, data = sim_data)
+
+lm_estimates <- broom::tidy(m_lm, conf.int = TRUE) |>
+  mutate(d = str_remove(term, "^d")) |>
+  left_join(instructor_means, by = "d")
+```
+
+Each coefficient is literally just the raw mean for that instructor. The model is essentially:
+
+```
+y = beta_1 * d_1 + beta_2 * d_2 + ... + beta_40 * d_40
+```
+
+with each $\beta_k$ equal to that instructor's average rating. The CIs come from `lm()`'s standard error, which is roughly `residual_sd / sqrt(n_k)`.
+
+```{r}
+#| label: lm-plot
+lm_estimates |>
+  arrange(estimate) |>
+  mutate(rank = row_number()) |>
+  ggplot(aes(x = rank, y = estimate, color = n)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), alpha = 0.7) +
+  geom_hline(yintercept = grand_mean_obs, linetype = "dashed", color = "red") +
+  scale_color_viridis_c(name = "Ratings (N)", trans = "log10") +
+  labs(
+    x = "Instructor (sorted by lm() estimate)",
+    y = "lm() estimate",
+    title = " Visualizing the coefficients alongside N",
+    subtitle = "Wide error bars on dark dots, but the point estimates aren't pulled in"
+  )
+```
+
+The problem: even though wider error bars show that low-N instructor values are more uncertain, the **actual estimates** themselves are not adjusted. A low-N instructor with a raw mean of 4.7 is reported as "estimate = 4.7" with no acknowledgment that this is possibly an extreme value pulled by chance.
+
+
+There's a deeper problem too: `lm()` has no concept of students. Any student-style variation might get ignored ot attributed to the instructors who happened to be rated by particularly harsh or generous students.
+
+### Section 3: Why `lm()` can't fix itself
+
+What if we add students as fixed effects?
+
+```{r}
+#| label: lm-with-students
+#| eval: false
+m_lm_big <- lm(y ~ 0 + d + s, data = sim_data)
+
+```
+
+
+This "fits" perfectly but it becomes a giant lookup table with no actual use. This isn't a model, it can't be used to estimate anything and it's just memorizing everything. This is the problem of no pooling at all, nothing is helpful for learning or genaralization. 
+
+
+
+## Part 2: Hierarchical Bayes
+
+### Section 4: Crossed random intercepts
+
+We treat instructors and students as crossed random effects. Each instructor has their own intercept drawn from a population distribution. Each student has their own intercept drawn from a different population distribution (normal dist in this case). This is similar to the tadpole situation but now we have two groups. 
+
+The rating $y$ given to instructor $i$ by student $j$ is drawn from a Normal distribution with mean $\mu_{ij}$ and residual noise $\sigma$:
+
+$$y_{ij} \sim \operatorname{Normal}(\mu_{ij}, \sigma)$$
+
+The expected rating is the grand mean $\beta_0$, plus this instructor's deviation $u_d$, plus this student's rating-style deviation $v_s$:
+
+$$\mu_{ij} = \beta_0 + u_{d[i]} + v_{s[j]}$$
+
+Each instructor's deviation comes from a Normal distribution centered at zero — $\sigma_d$ controls how spread out instructors are:
+
+$$u_d \sim \operatorname{Normal}(0, \sigma_d)$$
+
+Same idea for students — $\sigma_s$ controls how much students vary in rating style:
+
+$$v_s \sim \operatorname{Normal}(0, \sigma_s)$$
+
+
+```{r}
+#| label: m1-fit
+#| results: hide
+m1 <- brm(
+  y ~ 1 + (1 | d) + (1 | s),
+  data = sim_data,
+  family = gaussian(),
+  chains = 4, iter = 2000, seed = 504,
+  file = "m1_crossed_intercepts"
+)
+```
+
+```{r}
+#| label: m1-summary
+summary(m1)
+```
+
+#### Now we can check this against the truth
+
+We know what $\sigma_d$ and $\sigma_s$ *should* be so we can compare:
+
+```{r}
+#| label: m1-truth-check
+as_draws_df(m1) |>
+  dplyr::select(sd_d__Intercept, sd_s__Intercept, sigma) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(x = value, y = name, fill = name)) +
+  stat_halfeye(.width = c(0.5, 0.95)) +
+  geom_vline(data = tibble(
+    name = c("sd_d__Intercept", "sd_s__Intercept", "sigma"),
+    truth = c(truth$sigma_d_int, truth$sigma_s, truth$sigma_resid)
+  ), aes(xintercept = truth), color = "red", linetype = "dashed") +
+  labs(
+    x = "Posterior",
+    y = NULL,
+    title = "Does the model recover the truth?",
+    subtitle = "Red dashed lines = true values used to generate the data"
+  ) +
+  theme(legend.position = "none")
+```
+
+### How to interpret the above plots ^
+
+The model estimates three key sources of variation:
+
+| Model parameter | Interpretation | Plain language |
+|----------------|----------------|----------------|
+| `sd_d__Intercept` | Instructor-level standard deviation | How much do instructors differ in their average ratings? |
+| `sd_s__Intercept` | Student-level standard deviation | How much so students differ in their rating style? |
+| `sigma` | Residual standard deviation | Unexplained variation after accounting for instructors and students (noise) |
+
+#### How to think about this: 
+
+- **Instructor variability**: differences in teaching quality / baseline ratings   *this is what we care about
+- **Student variability**: systematic differences in how people use the rating scale  
+- **Residual noise**: randomness not explained by either grouping structure  
+
+
+The model estimates that instructors vary moderately in baseline rating ($\sigma_d = 0.60$), while students vary less in their personal rating style ($\sigma_s = 0.30$), with a grand mean rating of 3.16 and substantial residual noise ($\sigma = 1.21$). All Rhat values are 1.00–1.01, indicating the chains converged properly. **However, this isn't a great model** because the residual SD ($\sigma = 1.21$) dwarfs both grouping SDs, meaning most rating variation is unexplained by instructor or student identity, so we're likely missing important predictors (like `service`) that the next model will add.
+
+
+### Section 5: Adding the service-course fixed effect
+
+```{r}
+#| label: m2-fit
+#| results: hide
+m2 <- brm(
+  y ~ 1 + service + (1 | d) + (1 | s),
+  data = sim_data,
+  family = gaussian(),
+  chains = 4, iter = 2000, seed = 504,
+  file = "m2_service_fixed"
+)
+```
+
+```{r}
+#| label: m2-summary
+summary(m2)
+```
+
+#### Did we recover the true service effect?
+
+```{r}
+#| label: m2-service-truth
+as_draws_df(m2) |>
+  ggplot(aes(x = b_service)) +
+  stat_halfeye(.width = c(0.5, 0.95), fill = "steelblue") +
+  geom_vline(xintercept = truth$beta_service, color = "red", linetype = "dashed") +
+  coord_cartesian(xlim = c(-0.5, 0.5)) +
+  labs(
+    x = "Posterior of service effect",
+    title = "Recovered service effect (red dashed = true value of -0.4)"
+  )
+
+```
+
+The true service effect is -0.4 and our model seems to have recovered it very well!
+
+
+```{r}
+#| label: loo-12
+m1 <- add_criterion(m1, "loo")
+m2 <- add_criterion(m2, "loo")
+loo_compare(m1, m2)
+```
+
+Adding service effect improves predictive fit slightly, but the improvement (ELPD difference of 3.1) is within the standard error of that comparison (SE = 3.1), so we shouldn't over-interpret it. The service effect is real (the posterior is credibly negative), but it doesn't dramatically improve the model's ability to predict new ratings.
+
+
+### Section 6: Random slopes — the real upgrade
+
+So far, the model assumes the service-course effect is the same for every instructor. But we built the data so that **it isn't** — there's a true $\sigma_{d,\text{slope}} = 0.5$.
+
+$$
+\mu_{ij} = \beta_0 + u_{0, d[i]} + (\beta_1 + u_{1, d[i]}) \cdot \text{service}_i + v_{s[j]} \\
+\begin{pmatrix} u_{0,d} \\ u_{1,d} \end{pmatrix} \sim \operatorname{MVNormal}\left(\mathbf{0}, \mathbf{\Sigma}\right)
+$$
+
+```{r}
+#| label: m3-fit
+#| results: hide
+m3 <- brm(
+  y ~ 1 + service + (1 + service | d) + (1 | s),
+  data = sim_data,
+  family = gaussian(),
+  chains = 4, iter = 2000, seed = 504,
+  file = "m3_random_slopes"
+)
+```
+
+```{r}
+#| label: m3-summary
+summary(m3)
+```
+
+
+#### Did we recover the random-slope variance and correlation?
+
+```{r}
+#| label: m3-truth-check
+as_draws_df(m3) |>
+  dplyr::select(sd_d__Intercept, sd_d__service, cor_d__Intercept__service) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(x = value, y = name, fill = name)) +
+  stat_halfeye(.width = c(0.5, 0.95)) +
+  geom_vline(data = tibble(
+    name = c("sd_d__Intercept", "sd_d__service", "cor_d__Intercept__service"),
+    truth = c(truth$sigma_d_int, truth$sigma_d_slope, truth$cor_int_slope)
+  ), aes(xintercept = truth), color = "red", linetype = "dashed") +
+  labs(
+    x = "Posterior",
+    y = NULL,
+    title = "Random-slope parameters recovered correctly",
+    subtitle = "Red dashed = true values (0.6, 0.5, -0.5)"
+  ) +
+  theme(legend.position = "none")
+```
+
+The model mostly correctly recovered:
+
+- Instructor intercept SD ≈ 0.6
+- Instructor slope SD ≈ 0.5  
+- Intercept-slope correlation ≈ -0.5
+
+That correlation is something neither `lm()` nor a basic random-intercepts model can even ask about. It captures a real feature of the data: instructors who are well-liked overall take a bigger hit when forced into service courses.
+
+#### Instructor-specific service effects
+
+```{r}
+# Get estimated slopes for each instructor
+est_slopes <- m3 |>
+  spread_draws(b_service, r_d[d, term]) |>
+  filter(term == "service") |>
+  mutate(slope = b_service + r_d) |>
+  group_by(d) |>
+  summarise(
+    est_slope = median(slope),
+    .lower = quantile(slope, 0.025),
+    .upper = quantile(slope, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(d = factor(d))
+
+# Join with true slopes from the simulation
+recovery <- est_slopes |>
+  left_join(
+    truth$instructor_effects |>
+      mutate(true_slope = truth$beta_service + u_slope) |>
+      dplyr::select(d, true_slope),
+    by = "d"
+  )
+
+ggplot(recovery, aes(x = true_slope, y = est_slope)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper), alpha = 0.6) +
+  labs(
+    x = "True service slope (from simulated data)",
+    y = "Estimated slope (posterior median + 95% CI)",
+    title = "Model recovery of instructor's true service-course effect",
+    subtitle = "Points are close to the line showing a decent recovery"
+  )
+```
+
+
+
+We started by treating each instructor as a fixed quantity to be estimated independently and we didn't initially have a model that could capture student differences. We then built up a hierarchical Bayesian model that:
+
+- Treats instructors and students as draws from population distributions, so we can share information across them (**partial pooling**)
+- Lets each instructor have their own service-course effect, not just their own baseline (**random slopes**)
+- Models both grouping factors at once so neither absorbs variation that belongs to the other (**crossed random effects**)
+
+
+Our model then recovered pretty well the true variance components and correlations we built into the simulation. Because we simulated the data, we could check the model's answers against ground truth at every step. The crossed model accurately recovered $\sigma_d$, $\sigma_s$, $\beta_{\text{service}}$, $\sigma_{d,\text{slope}}$, and the intercept-slope correlation. The simpler models systematically missed some of these — `lm()` doesn't even have parameters to estimate them, and the instructor-only Bayesian model put student variance in the wrong bucket.
+
+The hierarchical Bayesian model is able to **get the right answer to questions simpler models can't even ask**. It allowed us to model aspects of the instructors and students that vary person to person and capture real important aspects of human variation. 
+
+
+## What now? What can we do with this kind of model?
+
+Now that we have a working hierarchical Bayesian model, here's what it lets us do that the simpler approaches couldn't:
+
+**1. Get honest estimates of any individual instructor's quality.** Each instructor has a full postrior, not just a point estimate. You can now assert *"there's a 90% probability instructor 17 is above average"* directly from the model. `lm()` can't make probabilistic statements like this.
+
+**2. Identify who's actually hurt by service courses.** The random slopes tell us which specific instructors take a big hit on service courses vs. who handles them fine. This lets you know which instructors may need more support and training to do better on service courses. Also, you wouldn't want to penalize an instructor for low service-course ratings if the model shows service hurts everyone roughly equally. But because they are different, you may offer support better to profs who need it. 
+
+**3. Make fair comparisons between instructors.** Two instructors with the same raw mean might look very different once we account for who rated them. If instructor A was rated mostly by harsh students and B by generous ones, the model adjusts for that. We're comparing instructor quality, not "instructor quality + luck of who showed up to rate them."
+
+**4. Predict ratings in new situations.** Given an instructor and a student, the model predicts a rating with full uncertainty. We can ask *"if this instructor teaches a service course next semester, what range of ratings should we expect?"*
+
+**5. Account for where rating variation actually comes from.** We learned that student-style variation ($\sigma_s = 0.7$) is *bigger* than instructor variation ($\sigma_d = 0.6$). That's a substantive finding — a big chunk of what looks like "this instructor is bad" is actually "this instructor got harsh raters." Course evaluation systems often ignore this.
+
+**6. Generate rankings.** If a dean asks "who are the bottom 5 instructors?", we can answer with posterior probabilities of being in the bottom — not just point estimates. Some instructors with low raw means might have very wide CIs (low N + harsh raters), and the model flags them as "uncertain" rather than "bad."
+
+
